@@ -3,5 +3,10 @@ __pycache__/
 venv/
 env/
 .env
+.env.*
 .roo_deepseek_cache.json
+.vscode/
+*.pem
+*.key
+credentials.*
 gemini.md

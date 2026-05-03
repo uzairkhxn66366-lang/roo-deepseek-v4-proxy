@@ -8,12 +8,17 @@ import hashlib
 app = FastAPI()
 
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
-# Users can set their key in Roo Code, or via environment variable
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 
-# --- THE BULLETPROOF MEMORY CACHE ---
+# --- 1. PERSISTENT CACHE ---
 tool_cache = {}
 text_cache = {}
+
+# --- 2. THE PENDING STATE (DeepSeek's Logic) ---
+_pending_state = {
+    "reasoning": "",
+    "tool_call_ids":[]
+}
 
 def save_cache():
     try:
@@ -46,8 +51,30 @@ async def get_models():
         ]
     }
 
+def extract_regular_text(content_block):
+    """Helper to safely extract string text from Roo Code's arrays"""
+    if isinstance(content_block, str):
+        return content_block
+    if isinstance(content_block, list):
+        regular_text = ""
+        for block in content_block:
+            b_type = block.get("type", "text")
+            if b_type in ["text", "reasoning"]:
+                regular_text += block.get("text", "")
+            elif b_type == "tool_result":
+                sub = block.get("content",[])
+                if isinstance(sub, list):
+                    for sub_b in sub:
+                        regular_text += sub_b.get("text", "")
+                elif isinstance(sub, str):
+                    regular_text += sub
+        return regular_text
+    return ""
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    global _pending_state
+    
     try:
         body = await request.json()
     except Exception:
@@ -55,46 +82,53 @@ async def chat_completions(request: Request):
 
     messages = body.get("messages",[])
     
-    for msg in messages:
-        if msg.get("role") == "assistant":
-            # 1. ATTEMPT TO RESTORE REASONING FROM MEMORY CACHE
-            t_calls = msg.get("tool_calls",[])
-            if isinstance(t_calls, list):
-                for tc in t_calls:
-                    t_id = tc.get("id")
-                    if t_id and t_id in tool_cache:
-                        msg["reasoning_content"] = tool_cache[t_id]
-                        break
-            
-            if "reasoning_content" not in msg:
-                c_text = msg.get("content")
-                if isinstance(c_text, str) and c_text.strip():
-                    thash = hashlib.md5(c_text.strip().encode('utf-8')).hexdigest()
-                    if thash in text_cache:
-                        msg["reasoning_content"] = text_cache[thash]
+    # Identify the index of the very LAST assistant message in the history
+    assistant_indices =[i for i, m in enumerate(messages) if m.get("role") == "assistant"]
+    last_assistant_idx = assistant_indices[-1] if assistant_indices else -1
 
-        # 2. FLATTEN CONTENT ARRAYS
-        content = msg.get("content")
-        if isinstance(content, list):
-            reasoning_text = ""
-            regular_text = ""
-            for block in content:
-                b_type = block.get("type", "text")
-                if b_type == "reasoning":
-                    reasoning_text += block.get("text", "")
-                elif b_type == "text":
-                    regular_text += block.get("text", "")
-                elif b_type == "tool_result":
-                    sub_content = block.get("content",[])
-                    if isinstance(sub_content, list):
-                        for sub_b in sub_content:
-                            regular_text += sub_b.get("text", "")
-                    elif isinstance(sub_content, str):
-                        regular_text += sub_content
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "assistant":
             
-            if msg.get("role") == "assistant" and reasoning_text and "reasoning_content" not in msg:
-                msg["reasoning_content"] = reasoning_text
+            c_text = extract_regular_text(msg.get("content"))
+            c_text_stripped = c_text.strip() if c_text else ""
+            thash = hashlib.md5(c_text_stripped.encode('utf-8')).hexdigest() if c_text_stripped else None
+
+            # --- DEEPSEEK'S PENDING LOGIC INJECTION ---
+            # If this is the last assistant message, and we just captured reasoning from the previous stream...
+            if i == last_assistant_idx and _pending_state["reasoning"]:
+                msg["reasoning_content"] = _pending_state["reasoning"]
                 
+                # Lock this newly formatted text (even if interrupted) into persistent cache
+                if thash:
+                    text_cache[thash] = _pending_state["reasoning"]
+                for tid in _pending_state["tool_call_ids"]:
+                    tool_cache[tid] = _pending_state["reasoning"]
+                save_cache()
+                
+                # Clear the pending state so it doesn't double-fire
+                _pending_state = {"reasoning": "", "tool_call_ids":[]}
+            
+            # --- STANDARD CACHE RESTORATION (For older messages in the history) ---
+            if "reasoning_content" not in msg or not msg["reasoning_content"]:
+                t_calls = msg.get("tool_calls",[])
+                if isinstance(t_calls, list):
+                    for tc in t_calls:
+                        t_id = tc.get("id")
+                        if t_id and t_id in tool_cache:
+                            msg["reasoning_content"] = tool_cache[t_id]
+                            break
+                            
+            if ("reasoning_content" not in msg or not msg["reasoning_content"]) and thash:
+                if thash in text_cache:
+                    msg["reasoning_content"] = text_cache[thash]
+
+            # --- THE SAFETY FALLBACK ---
+            if "reasoning_content" not in msg or not msg["reasoning_content"]:
+                msg["reasoning_content"] = "Analyzed previous context and executed tools."
+
+        # Flatten all content for strict DeepSeek API rules
+        if isinstance(msg.get("content"), list):
+            regular_text = extract_regular_text(msg.get("content"))
             msg["content"] = regular_text if regular_text else None
 
     headers = {"Content-Type": "application/json"}
@@ -118,8 +152,8 @@ async def chat_completions(request: Request):
             return Response(content=err_content, status_code=response.status_code, media_type="application/json")
             
         async def stream_generator():
+            global _pending_state
             reasoning_accumulator = ""
-            content_accumulator = ""
             tool_call_ids =[]
             
             async for line in response.aiter_lines():
@@ -132,8 +166,6 @@ async def chat_completions(request: Request):
                         
                         if "reasoning_content" in delta and delta["reasoning_content"]:
                             reasoning_accumulator += delta["reasoning_content"]
-                        if "content" in delta and delta["content"]:
-                            content_accumulator += delta["content"]
                             
                         if "tool_calls" in delta and isinstance(delta["tool_calls"], list):
                             for tc in delta["tool_calls"]:
@@ -143,19 +175,10 @@ async def chat_completions(request: Request):
                     except Exception:
                         pass
                         
+            # --- POPULATE THE PENDING STATE ON STREAM END ---
             if reasoning_accumulator:
-                made_changes = False
-                for t_id in tool_call_ids:
-                    tool_cache[t_id] = reasoning_accumulator
-                    made_changes = True
-                    
-                if content_accumulator.strip():
-                    thash = hashlib.md5(content_accumulator.strip().encode('utf-8')).hexdigest()
-                    text_cache[thash] = reasoning_accumulator
-                    made_changes = True
-                    
-                if made_changes:
-                    save_cache()
+                _pending_state["reasoning"] = reasoning_accumulator
+                _pending_state["tool_call_ids"] = tool_call_ids
                     
             await response.aclose()
             
